@@ -1,4 +1,4 @@
-"""
+﻿"""
 消融对比实验：同一评测集上比较「优化前 / 优化中 / 优化后」的检索指标
 
 三种检索器（都用知识库里同一份评测文档）：
@@ -62,7 +62,7 @@ def main():
     import knowledge
     from knowledge import MyKnowledge
 
-    cases = [c for c in json.loads(DATA.read_text(encoding="utf-8")) if c["source"]]
+    cases = [c for c in json.loads(DATA.read_text(encoding="utf-8-sig")) if c["source"]]
     for f in DOCS.iterdir():
         shutil.copy(f, Path(knowledge.KNOWLEDGE_DIR) / f.name)
     kb = MyKnowledge()
@@ -73,41 +73,52 @@ def main():
     from langchain_classic.retrievers import EnsembleRetriever
     from custom_loader import MyCustomLoader
 
-    collections = [f.name for f in DOCS.iterdir() if f.is_file()]
+    # 集合名是文件名的 md5（knowledge.load_knowledge 的命名规则），不是文件名
+    files = {knowledge.get_md5(f.name): f.name for f in DOCS.iterdir() if f.is_file()}
     emb = MyKnowledge._MyKnowledge__embeddings
     stores = {g: Chroma(collection_name=g, embedding_function=emb,
-                        persist_directory=os.path.join('./chroma', g)) for g in collections}
-    chunks = {}  # 供 BM25 使用的切分结果（与入库时同一份切分）
-    for g in collections:
-        name = next(f for f in collections if knowledge.get_md5(f) == g)
-        chunks[g] = MyCustomLoader(os.path.join(knowledge.KNOWLEDGE_DIR, name)).load()
+                        persist_directory=os.path.join('./chroma', g)) for g in files}
+    chunks = {g: MyCustomLoader(os.path.join(knowledge.KNOWLEDGE_DIR, name)).load()
+              for g, name in files.items()}  # 供 BM25 使用，与入库时同一份切分
 
-    def sources_of(docs):
-        return [os.path.basename(d.metadata.get("source", "")) for d in docs]
+    def sources_of(docs, n=3):
+        return [os.path.basename(d.metadata.get("source", "")) for d in docs[:n]]
+
+    def rrf(ranked_lists, k=60, n=3):
+        """倒数排名融合：各召回列表按位置加权合并，再取前 n（跨集合比较分数的通用做法）。"""
+        score = {}
+        for docs in ranked_lists:
+            for pos, d in enumerate(docs):
+                key = d.page_content[:200]
+                score.setdefault(key, [0.0, d])
+                score[key][0] += 1.0 / (k + pos + 1)
+        return [d for _, d in sorted(score.values(), key=lambda x: -x[0])][:n]
 
     def vector_only(q):
-        out = []
-        for g in collections:
-            out.extend(stores[g].similarity_search(q, k=3))
-        return sources_of(out)
+        # 每库取 20 条候选，按余弦相似度合并后取前 3（只有这一种方案有可比分数）
+        cand = []
+        for g in files:
+            cand.extend(stores[g].similarity_search_with_relevance_scores(q, k=knowledge.RECALL_K))
+        cand.sort(key=lambda x: -x[1])
+        return sources_of([d for d, _ in cand])
 
     def hybrid_only(q):
-        out = []
-        for g in collections:
+        lists = []
+        for g in files:
             ens = EnsembleRetriever(
                 retrievers=[stores[g].as_retriever(search_kwargs={"k": knowledge.RECALL_K}),
                             BM25Retriever.from_documents(chunks[g], k=knowledge.RECALL_K)])
-            out.extend(ens.invoke(q))
-        return sources_of(out)
+            lists.append(ens.invoke(q))
+        return sources_of(rrf(lists))
 
     def production(q):
         out = []
-        for g in collections:
-            r = kb.get_retrievers(g)
+        for name in files.values():   # get_retrievers 接收文件名，内部再算 md5
+            r = kb.get_retrievers(name)
             if r is not None:
                 out.extend(r.invoke(q))
         out.sort(key=lambda d: d.metadata.get("relevance_score", 0.0), reverse=True)
-        return sources_of(out[:3])
+        return sources_of(out)
 
     variants = [evaluate("vector", vector_only, cases),
                 evaluate("hybrid", hybrid_only, cases),

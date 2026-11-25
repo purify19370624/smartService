@@ -45,10 +45,12 @@ REPORTS = EVAL_DIR / "reports"
 # 知识外问题的三种「正确」反应
 REFUSAL_MARKERS = ("没有找到", "无法回答", "抱歉", "没有相关", "未找到")
 WEB_PREFIX = "（知识库没有找到依据"
+# 兜底链路自身异常时 CombineClient 会返回这句（账号欠费/搜索权限不可用都会走到这里）
+ERROR_MARK = "系统处理您的消息时出现异常"
 
 
 def load_cases():
-    return json.loads(DATA.read_text(encoding="utf-8"))
+    return json.loads(DATA.read_text(encoding="utf-8-sig"))
 
 
 def install_docs(kb):
@@ -143,32 +145,39 @@ def eval_e2e(llm, cases):
     """
     rows = []
     for c in cases:
-        sid = f"eval-{c['id']}-{int(time.time() * 1000)}"
-        t0 = time.perf_counter()
-        first = None
-        answer, has_ctx, web = "", False, False
-        try:
-            for chunk in llm.stream(c["question"], session_id=sid):
-                if "context" in chunk:
-                    has_ctx = True
-                text = chunk.get("answer")
-                if text:
-                    if first is None:
-                        first = time.perf_counter() - t0
-                    answer += text
-                    web = web or text.startswith(WEB_PREFIX)
-        except Exception as e:  # 单个样本失败不影响整体
-            answer = f"<error: {e}>"
-        finally:
-            llm.restore_history(sid, [])
+        # 账号限流/欠费会让单次调用失败并返回兜底文案，重试 3 次再判定，避免把偶发失败算进指标
+        answer, has_ctx, web, first = "", False, False, None
+        for attempt in range(3):
+            sid = f"eval-{c['id']}-{int(time.time() * 1000)}"
+            t0 = time.perf_counter()
+            answer, has_ctx, web, first = "", False, False, None
+            try:
+                for chunk in llm.stream(c["question"], session_id=sid):
+                    if "context" in chunk:
+                        has_ctx = True
+                    text = chunk.get("answer")
+                    if text:
+                        if first is None:
+                            first = time.perf_counter() - t0
+                        answer += text
+                        web = web or text.startswith(WEB_PREFIX)
+            except Exception as e:  # 单个样本失败不影响整体
+                answer = f"<error: {e}>"
+            finally:
+                llm.restore_history(sid, [])
+            if ERROR_MARK not in answer:
+                break
+            time.sleep(3)
 
         kws = c["answer_keywords"]
         kw_ok = (not kws) or all(k in answer for k in kws)
+        errored = ERROR_MARK in answer
         rejected = web or any(m in answer for m in REFUSAL_MARKERS)
         ok = has_ctx if c["source"] else rejected
         rows.append({
             "id": c["id"], "question": c["question"], "in_kb": bool(c["source"]),
-            "grounded": has_ctx, "web_fallback": web, "keyword_ok": kw_ok,
+            "grounded": has_ctx, "web_fallback": web, "web_ok": web and not errored,
+            "errored": errored, "keyword_ok": kw_ok,
             "passed": ok, "first_token_s": round(first, 2) if first else None,
             "answer": answer[:300],
         })
@@ -182,6 +191,8 @@ def eval_e2e(llm, cases):
         "grounded_rate": round(sum(r["grounded"] for r in in_kb) / max(len(in_kb), 1), 4),
         "keyword_hit_rate": round(sum(r["keyword_ok"] for r in in_kb) / max(len(in_kb), 1), 4),
         "no_hallucination_rate": round(sum(r["passed"] for r in out_kb) / max(len(out_kb), 1), 4),
+        # 真正拿到联网结果的比例；账号欠费时这里会是 0，与「不硬答」是两件事
+        "web_fallback_ok_rate": round(sum(r["web_ok"] for r in out_kb) / max(len(out_kb), 1), 4),
         "pass_rate": round(sum(r["passed"] for r in rows) / max(len(rows), 1), 4),
         "first_token_avg_s": round(sum(ft) / len(ft), 2) if ft else None,
     }

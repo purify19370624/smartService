@@ -9,6 +9,7 @@ from logger import setup_logger
 from models import ALI_QWEN_MAX_MODEL
 import chat_store
 from concurrent.futures import ThreadPoolExecutor
+from html import escape
 import os
 import threading
 import uuid
@@ -453,6 +454,108 @@ def delete_conversation(conv_id, chat_history, session_state):
     return _conv_choices(), gr.update(), session_state, gr.update()
 
 
+# ---- 满意度评分 / 运营数据看板 ----
+
+# 【声明的属性】RATE_LABEL：满意度控件的常态提示语（打分后会被「已记录」覆盖）。
+RATE_LABEL = "本次对话满意度（1-5 分，点数字即提交）"
+
+
+def _answered(chat_history):
+    """
+    这段聊天记录里有没有真正的回答（submit_show 追加的空占位不算）。
+
+    :param chat_history: 当前聊天记录（messages 格式），可为 None。
+    :return: 至少有一条带内容的助手消息返回 True。
+    """
+    return any(m["role"] == "assistant" and _msg_text(m).strip() for m in chat_history or [])
+
+
+def sync_rating(chat_history, session_state):
+    """
+    把满意度控件切到当前对话的状态：有问答才显示，并回显这条对话已打的分。
+
+    分数挂在 session_id 上（chat_store.ratings），所以点回左侧历史对话也能看到、改掉分数。
+
+    :param chat_history: 当前聊天记录（messages 格式）。
+    :param session_state: 当前会话 ID（str）。
+    :return: 满意度 Radio 的更新对象（可见性 + 已打分数 + 提示语）。
+    """
+    answered = _answered(chat_history)
+    return gr.update(
+        visible=answered,
+        value=chat_store.get_rating(session_state) if answered and session_state else None,
+        label=RATE_LABEL,
+    )
+
+
+def rate_conversation(session_id, score):
+    """
+    点数字即提交评分（再点别的数字就是改分）。
+
+    没有会话或还没有回答时拒绝写入：满意度是运营指标，不能让空对话进来凑数。
+
+    :param session_id: 当前会话 ID（str）。
+    :param score: 用户点的分数（1-5，int）；未选择时为 None。
+    :return: 满意度 Radio 的更新对象（只改提示语，选中的分数保持用户点的那个）。
+    """
+    if not session_id or score is None or not chat_store.rate(session_id, int(score)):
+        return gr.update(label="⚠️ 还没有问答，先提问再评分")
+    return gr.update(label=f"✅ 已记录 {int(score)} 分，感谢反馈")
+
+
+def _bars(rows):
+    """
+    把 [(标签, 数值)] 画成一列 HTML 横条（条宽按本组最大值归一）。
+
+    :param rows: 标签与数值的二元组列表。
+    :return: HTML 字符串；rows 为空时返回空串。
+    """
+    top = max((n for _, n in rows), default=0) or 1
+    return "".join(
+        f'<div class="bar-row"><span class="bar-label">{escape(str(k))}</span>'
+        f'<span class="bar-track"><span class="bar-fill" style="width:{n / top * 100:.0f}%"></span></span>'
+        f'<span class="bar-value">{n}</span></div>'
+        for k, n in rows
+    )
+
+
+def dashboard_html():
+    """
+    运营数据看板：核心指标 + 满意度分布 + 近 14 天对话量 + 最近评分。
+
+    数据全部现从 db/conversations.db 算（对话 / 消息 / 评分三张表）。
+
+    shortcut: 日趋势只能按 conversations.updated_at 归日（消息表没有时间戳），
+              一个会话多轮只算在最近更新那天，要按轮次统计再给 messages 加时间戳。
+
+    :return: 看板 HTML；传到 gr.HTML 时由 Gradio 在每次打开页面时调用。
+    """
+    s = chat_store.stats()
+    avg = "—" if s["avg_score"] is None else f'{s["avg_score"]:.2f}'
+    cover = f'{s["rated"] * 100 // s["conversations"]}%' if s["conversations"] else "—"
+    cards = [("对话总数", s["conversations"]), ("问答总量", s["qa"]), ("已评分对话", s["rated"]),
+             ("评分覆盖率", cover), ("平均满意度", avg)]
+    score_rows = [(f"{i} 分", s["scores"].get(i, 0)) for i in (5, 4, 3, 2, 1)]
+    daily_rows = [(d[5:], n) for d, n in s["daily"]]
+    recent = "".join(
+        f"<tr><td>{escape(title)}</td><td>{score} 分</td><td>{at}</td></tr>"
+        for title, score, at in s["recent"]
+    ) or '<tr><td colspan="3">还没有评分</td></tr>'
+    return f"""
+<div class="dash">
+  <div class="kpi-row">{''.join(
+      f'<div class="kpi"><b>{v}</b><small>{k}</small></div>' for k, v in cards)}</div>
+  <div class="dash-grid">
+    <div class="dash-card"><h4>满意度分布</h4>{_bars(score_rows)}</div>
+    <div class="dash-card"><h4>近 14 天对话量</h4>{_bars(daily_rows) or "<p>暂无数据</p>"}</div>
+  </div>
+  <div class="dash-card"><h4>最近评分</h4>
+    <table class="dash-table"><tr><th>对话</th><th>满意度</th><th>时间</th></tr>{recent}</table>
+  </div>
+</div>
+"""
+
+
 # 【声明的属性】CSS：页面样式，对标 ChatGPT——左侧浅灰会话栏、中间窄对话列、底部圆角输入条。
 # Gradio 6 的 gr.Blocks 不再接收 css，样式要在 launch(css=...) 里传。
 CSS = """
@@ -501,12 +604,20 @@ html:has(.app-row), body:has(.app-row) {height: 100%; overflow: hidden !importan
 .conv-row:hover .conv-del, .conv-row:focus-within .conv-del {opacity: 1;}
 .conv-del:hover {color: #c0392b !important;}
 
-/* 侧栏底部（管理入口），像 ChatGPT 的设置项 */
+/* 侧栏底部（管理 / 看板入口），像 ChatGPT 的设置项；只有第一个吃掉上方的空白 */
 .side-foot {margin-top: auto !important;}
+.side-foot ~ .side-foot {margin-top: 0 !important;}
 .side-foot, .side-foot button {width: 100% !important; justify-content: flex-start !important;
             border: none !important; background: transparent !important; color: #444 !important;
             box-shadow: none !important; font-size: 14px !important;}
 .side-foot:hover {background: #ececec !important;}
+
+/* ---- 满意度打分条：有回答才出现，贴在输入条上方 ---- */
+.rate-row {padding: 0 !important; margin: 0 0 6px !important;}
+.rate-row .block, .rate-row label {border: none !important; background: transparent !important;
+            box-shadow: none !important; padding: 0 !important;}
+.rate-row span[data-testid="block-info"], .rate-row .info {font-size: 13px !important; color: #6b7280 !important;}
+.rate-row .wrap {gap: 10px !important;}
 
 /* ---- 中间对话列 ---- */
 .chat-col {max-width: 860px !important; margin: 0 auto !important; height: 100vh;
@@ -560,6 +671,25 @@ html:has(.app-row), body:has(.app-row) {height: 100%; overflow: hidden !importan
 /* ---- /admin 管理页（沿用窄列，但不要对话页的满屏高度） ---- */
 .admin-col {max-width: 860px !important; margin: 0 auto !important; padding: 16px 20px !important;}
 .chunks {max-height: 40vh; overflow-y: auto;}
+
+/* ---- /dashboard 运营看板：指标卡 + 横条图 + 明细表（纯 CSS，不引图表库） ---- */
+.dash {display: flex; flex-direction: column; gap: 16px; color: #202020;}
+.kpi-row {display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;}
+.kpi {background: #f7f8fa; border: 1px solid #ececf0; border-radius: 12px; padding: 12px 14px;
+      display: flex; flex-direction: column; gap: 4px;}
+.kpi b {font-size: 24px; font-weight: 700; line-height: 1.1;}
+.kpi small {color: #6b7280; font-size: 12px;}
+.dash-grid {display: grid; grid-template-columns: 1fr 1fr; gap: 12px;}
+.dash-card {border: 1px solid #ececf0; border-radius: 12px; padding: 14px 16px;}
+.dash-card h4 {margin: 0 0 10px; font-size: 14px; font-weight: 600; color: #111;}
+.bar-row {display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 13px;}
+.bar-label {flex: 0 0 52px; color: #6b7280;}
+.bar-track {flex: 1 1 auto; height: 14px; background: #f0f1f4; border-radius: 7px; overflow: hidden;}
+.bar-fill {display: block; height: 100%; background: #2f6bff; border-radius: 7px;}
+.bar-value {flex: 0 0 34px; text-align: right; color: #374151;}
+.dash-table {width: 100%; border-collapse: collapse; font-size: 13px;}
+.dash-table th, .dash-table td {text-align: left; padding: 6px 8px; border-bottom: 1px solid #f0f1f4;}
+.dash-table th {color: #6b7280; font-weight: 500;}
 """
 
 # 创建一个Gradio Blocks应用（左侧栏对话记录 + 对话主区；知识库管理是 /admin 独立页面）
@@ -593,6 +723,7 @@ with gr.Blocks(title="电商智能客服") as demo:
 
             # 管理入口放侧栏底部（对标 ChatGPT 左下角的设置项）
             admin_link = gr.Button("⚙ 知识库管理", elem_classes="side-foot")
+            dashboard_link = gr.Button("📊 运营看板", elem_classes="side-foot")
 
         # ===== 对话主区（客户） =====
         with gr.Column(scale=1, elem_classes="chat-col"):
@@ -620,6 +751,11 @@ with gr.Blocks(title="电商智能客服") as demo:
                 elem_classes="chat-window",
             )
 
+            # 【声明的属性】rating：本次对话的满意度（1-5 分）。
+            # 默认隐藏，由 sync_rating 跟着对话状态开关——没有问答就不给打分，免得污染运营数据。
+            rating = gr.Radio(choices=[1, 2, 3, 4, 5], label=RATE_LABEL, visible=False,
+                              elem_classes="rate-row")
+
             # 输入条：圆角胶囊 + 右侧圆形发送键
             with gr.Row(elem_classes="composer", equal_height=True):
                 # 【声明的属性】user_input：问题输入框
@@ -632,19 +768,25 @@ with gr.Blocks(title="电商智能客服") as demo:
 
     # ---- 对话页事件绑定 ----
     conv_pageload.load(fn=refresh_conversations, inputs=None, outputs=[conv_state])
-    new_chat.click(fn=new_conversation, inputs=None, outputs=[chatbot, session_state, welcome])
+    # 满意度控件跟着对话走：新建 / 切换 / 删除 / 每轮回答后都重算一次（有回答才出现）
+    _sync = dict(fn=sync_rating, inputs=[chatbot, session_state], outputs=[rating])
+    new_chat.click(fn=new_conversation, inputs=None, outputs=[chatbot, session_state, welcome]).then(
+        **_sync)
     open_sid.change(fn=open_conversation, inputs=[open_sid, chatbot, session_state],
-                    outputs=[chatbot, session_state, welcome])
+                    outputs=[chatbot, session_state, welcome]).then(**_sync)
     del_sid.change(fn=delete_conversation, inputs=[del_sid, chatbot, session_state],
-                   outputs=[conv_state, chatbot, session_state, welcome])
+                   outputs=[conv_state, chatbot, session_state, welcome]).then(**_sync)
+    # 点数字即打分（用 input 而不是 change：change 也会被上面程序化的回显触发）
+    rating.input(fn=rate_conversation, inputs=[session_state, rating], outputs=[rating])
     for _send in (user_input.submit, user_submit.click):
         _send(fn=submit_show, inputs=[user_input, chatbot],
               outputs=[user_input, chatbot, welcome]).then(
             fn=llm_reply, inputs=[chatbot, session_state], outputs=[chatbot, session_state]
         ).then(  # 回答结束后把这一轮存进左侧记录
             fn=save_conversation, inputs=[chatbot, session_state], outputs=[conv_state]
-        )
+        ).then(**_sync)
     admin_link.click(fn=None, js="() => {window.location.href = '/admin'}")
+    dashboard_link.click(fn=None, js="() => {window.location.href = '/dashboard'}")
 
 # ===== 知识库管理页（独立路由，从左侧「管理」进入） =====
 with demo.route("知识库管理", "/admin", show_in_navbar=False):
@@ -701,6 +843,16 @@ with demo.route("知识库管理", "/admin", show_in_navbar=False):
     admin_delete_btn.click(fn=do_delete, inputs=[admin_doc, admin_confirm],
                            outputs=[admin_delete_status, admin_doc, admin_doc_table])
     admin_view_btn.click(fn=do_view_chunks, inputs=[admin_doc], outputs=[admin_chunk_output])
+
+# ===== 运营数据看板（独立路由，从左侧「看板」进入） =====
+with demo.route("运营看板", "/dashboard", show_in_navbar=False):
+    with gr.Column(elem_classes="admin-col"):
+        with gr.Row():
+            gr.Markdown("### 运营数据看板")
+            dash_back = gr.Button("← 返回对话", size="sm", scale=0)
+        # 传函数而不是字符串：每次打开本页都重新从库里算
+        gr.HTML(dashboard_html)
+    dash_back.click(fn=None, js="() => {window.location.href = '/'}")
 
 # 启动 Gradio 应用（只在直接运行时启动，便于被测试脚本 import）
 if __name__ == "__main__":

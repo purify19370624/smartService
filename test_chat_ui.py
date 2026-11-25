@@ -1,4 +1,4 @@
-﻿"""
+"""
 对话页自测（不调用大模型）
 
 校验 Gradio messages 格式的「上屏 + 流式填充」：
@@ -102,7 +102,27 @@ def run():
     empty, new_sid, _ = main.new_conversation()
     assert empty["value"] == [] and new_sid and new_sid != sid
 
-    print("[通过] 对话页自测完成：上屏 / 流式填充 / 溯源 / 空提交 / 安全拦截 / 对话记录")
+    # 10. 满意度：没问答不能打分；有回答后能打、能改，并进运营看板统计
+    sid = f"test-{uuid.uuid4().hex}"
+    assert main.sync_rating([], sid)["visible"] is False          # 空对话不给打分
+    assert chat_store.rate(sid, 5) is False and chat_store.get_rating(sid) is None
+    history = _show("你好")
+    history = list(main.llm_reply(history, sid))[-1][0]
+    main.save_conversation(history, sid)
+    assert main.sync_rating(history, sid)["visible"] is True
+    assert chat_store.rate(sid, 2) is True and chat_store.get_rating(sid) == 2
+    assert chat_store.rate(sid, 5) is True and chat_store.get_rating(sid) == 5   # 重复打分=改分
+    assert main.sync_rating(history, sid)["value"] == 5                          # 切回对话回显分数
+    assert "已记录 5 分" in main.rate_conversation(sid, 5)["label"]
+    assert "还没有问答" in main.rate_conversation("", 5)["label"]
+    stat = chat_store.stats()
+    assert stat["conversations"] >= 1 and stat["qa"] >= 1 and stat["rated"] >= 1, stat
+    assert stat["scores"].get(5, 0) >= 1 and stat["daily"], stat
+    assert "满意度分布" in main.dashboard_html()
+    chat_store.delete_conversation(sid)
+    assert chat_store.get_rating(sid) is None                                     # 删对话连评分一起删
+
+    print("[通过] 对话页自测完成：上屏 / 流式填充 / 溯源 / 空提交 / 安全拦截 / 对话记录 / 满意度")
 
 
 if __name__ == "__main__":
