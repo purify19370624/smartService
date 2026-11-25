@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import os
 import shutil
 import threading
@@ -23,7 +23,8 @@ KNOWLEDGE_DIR = './chroma/knowledge/'
 # 【声明的属性】RECALL_K：混合召回候选数（模块级配置常量）。
 # 重排前先召回足够多的候选（向量检索与 BM25 各召回 K 条），
 # 让重排阶段有机会从更多候选中挑出最相关的块。
-RECALL_K = 10
+# 原为 10，按评测集调大到 20：embedding / rerank 请求次数不变，只是交给重排的候选更多。
+RECALL_K = 20
 
 # 【声明的属性】embedding_model：全局嵌入模型实例（模块级单例）。
 # 在导入时即初始化，供 MyKnowledge 向量化文档使用，避免重复创建连接。

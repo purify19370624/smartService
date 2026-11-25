@@ -20,6 +20,11 @@ EVAL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+# 没有可用 Key 时给出明确提示，而不是跑一半挂在 401 上
+if not os.getenv("DASHSCOPE_API_KEY"):
+    sys.exit("[跳过] 未设置 DASHSCOPE_API_KEY：消融实验需要真实 embedding / rerank 接口，"
+             "请先在 .env 中配置后运行 python eval/ablation.py")
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
