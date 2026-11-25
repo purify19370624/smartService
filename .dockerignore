@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.env
+.idea
+.vscode
+logs
+db
+chroma
+ppt
+eval/reports/local
+示例文档/*.pdf
+示例文档/*.docx

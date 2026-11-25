@@ -1,0 +1,14 @@
+services:
+  smart-service:
+    build: .
+    image: smart-service:latest
+    container_name: smart-service
+    env_file:
+      - .env            # DASHSCOPE_API_KEY 等密钥，不入库
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./chroma:/app/chroma   # 向量库 + 上传的知识库文档
+      - ./db:/app/db           # 会话记录 SQLite
+      - ./logs:/app/logs
+    restart: unless-stopped

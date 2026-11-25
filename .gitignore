@@ -1,0 +1,28 @@
+# 密钥：只提交 .env.example
+.env
+*.key
+
+# 虚拟环境与缓存
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# 运行时数据（向量库、会话库、日志、上传的知识库文档）
+chroma/
+db/
+logs/
+
+# 大型示例文档（体积大；评测用的小样本文档在 eval/data 下）
+示例文档/*.pdf
+示例文档/*.docx
+
+# 评测产出（本地生成的报告不入库）
+eval/reports/local/
+
+# 答辩 PPT（二进制、体积大，单独交付）
+ppt/
+$~$*.pptx
