@@ -12,3 +12,4 @@ services:
       - ./db:/app/db           # 会话记录 SQLite
       - ./logs:/app/logs
     restart: unless-stopped
+
