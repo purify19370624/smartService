@@ -1,13 +1,10 @@
 import re
-
 from langchain_community.document_loaders import CSVLoader, TextLoader, UnstructuredWordDocumentLoader, PyPDFLoader, \
     Docx2txtLoader
 from langchain_core.document_loaders import BaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from unstructured.file_utils.filetype import FileType, detect_filetype
 from loguru import logger
-
-
 class QATextSplitter(RecursiveCharacterTextSplitter):
     """问答类文档分割器：优先按"编号问题"切分，保持"问题+答案"完整。
 
